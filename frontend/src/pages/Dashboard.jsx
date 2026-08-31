@@ -1,29 +1,86 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { getNotes, deleteNote } from '../services/api';
+import { getNotes, deleteNote, togglePinNote, duplicateNote, exportNotes, importNotes } from '../services/api';
+import ThemeToggle from '../components/ThemeToggle';
 import './Dashboard.css';
 
 function Dashboard() {
   const [notes, setNotes] = useState([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [sort, setSort] = useState('newest');
   const navigate = useNavigate();
   const token = localStorage.getItem('token');
+  
+  const fileInputRef = useRef(null);
+  const [importMessage, setImportMessage] = useState('');
 
-  const fetchNotes = async () => {
+  const handleExport = async () => {
     try {
-      const response = await getNotes(token);
+      const response = await exportNotes(token);
+      const blob = new Blob([JSON.stringify(response.data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `notes-export-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError('Failed to export notes');
+    }
+  };
+
+  const handleImportClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleImportFile = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const notesToImport = Array.isArray(parsed) ? parsed : parsed.notes;
+
+      if (!Array.isArray(notesToImport)) {
+        setError('Invalid file format');
+        return;
+      }
+
+      const response = await importNotes(notesToImport, token);
+      setImportMessage(`${response.data.imported} notes imported successfully`);
+      setTimeout(() => setImportMessage(''), 3000);
+      fetchNotes(search, sort);
+    } catch (err) {
+      setError('Failed to import notes. Please check the file format.');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const fetchNotes = useCallback(async (q, sortValue) => {
+    try {
+      const response = await getNotes(token, { q, sort: sortValue });
       setNotes(response.data.notes);
     } catch (err) {
       setError('Failed to load notes');
     } finally {
       setLoading(false);
     }
-  };
+  }, [token]);
 
   useEffect(() => {
-    fetchNotes();
-  }, []);
+    fetchNotes('', 'newest');
+  }, [fetchNotes]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      fetchNotes(search, sort);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [search, sort, fetchNotes]);
 
   const handleDelete = async (id) => {
     if (!window.confirm('Are you sure you want to delete this note?')) return;
@@ -32,6 +89,28 @@ function Dashboard() {
       setNotes(notes.filter((note) => note._id !== id));
     } catch (err) {
       setError('Failed to delete note');
+    }
+  };
+
+  const handlePin = async (id) => {
+    try {
+      const response = await togglePinNote(id, token);
+      setNotes((prev) =>
+        prev
+          .map((n) => (n._id === id ? response.data.note : n))
+          .sort((a, b) => (b.isPinned - a.isPinned) || 0)
+      );
+    } catch (err) {
+      setError('Failed to update pin');
+    }
+  };
+
+  const handleDuplicate = async (id) => {
+    try {
+      const response = await duplicateNote(id, token);
+      setNotes((prev) => [response.data.note, ...prev]);
+    } catch (err) {
+      setError('Failed to duplicate note');
     }
   };
 
@@ -52,10 +131,32 @@ function Dashboard() {
             <p className="dashboard-subtitle">{notes.length} {notes.length === 1 ? 'note' : 'notes'}</p>
           </div>
         </div>
-        <button className="logout-btn" onClick={handleLogout}>Logout</button>
+        <div className="dashboard-header-actions">
+          <ThemeToggle />
+          <Link className="profile-link" to="/profile">Profile</Link>
+          <button className="logout-btn" onClick={handleLogout}>Logout</button>
+        </div>
       </div>
 
       {error && <p role="alert" className="auth-error" style={{ marginBottom: 20 }}>{error}</p>}
+      {error && <p role="alert" className="auth-error" style={{ marginBottom: 20 }}>{error}</p>}
+{importMessage && <p className="profile-success" style={{ marginBottom: 20 }}>✓ {importMessage}</p>}
+
+      <div className="dashboard-toolbar">
+        <input
+          type="text"
+          className="search-input"
+          placeholder="Search notes..."
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+        <select className="sort-select" value={sort} onChange={(e) => setSort(e.target.value)}>
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="title">Title A-Z</option>
+          <option value="edited">Last edited</option>
+        </select>
+      </div>
 
       <Link className="new-note-btn" to="/notes/new">+ New Note</Link>
 
@@ -67,14 +168,32 @@ function Dashboard() {
       ) : (
         <ul className="notes-grid">
           {notes.map((note) => (
-            <li className="note-card" key={note._id}>
-              <div className="note-card-accent"></div>
+            <li
+              className="note-card"
+              key={note._id}
+              style={{ borderLeft: `4px solid ${note.color || 'var(--primary)'}` }}
+            >
+              <div className="note-card-top">
+                <div className="note-card-accent"></div>
+                {note.isPinned && <span className="pin-badge">📌 Pinned</span>}
+              </div>
               <h3>{note.title}</h3>
               <p>{note.content.replace(/<[^>]+>/g, '').slice(0, 100)}...</p>
-              <div className="note-card-actions">
-                <Link to={`/notes/${note._id}`}>Edit</Link>
-                <button onClick={() => handleDelete(note._id)}>Delete</button>
-              </div>
+              {note.tags && note.tags.length > 0 && (
+                <div className="note-tags">
+                  {note.tags.map((tag) => (
+                    <span className="note-tag" key={tag}>#{tag}</span>
+                  ))}
+                </div>
+              )}
+              <div className="dashboard-header-actions">
+  <ThemeToggle />
+  <button className="io-btn" onClick={handleExport} title="Export notes">Export</button>
+  <button className="io-btn" onClick={handleImportClick} title="Import notes">Import</button>
+  <input type="file" accept=".json" ref={fileInputRef} onChange={handleImportFile} style={{ display: 'none' }} />
+  <Link className="profile-link" to="/profile">Profile</Link>
+  <button className="logout-btn" onClick={handleLogout}>Logout</button>
+</div>
             </li>
           ))}
         </ul>
